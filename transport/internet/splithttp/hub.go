@@ -1,11 +1,13 @@
 package splithttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"io"
 	gonet "net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,7 +80,7 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	}
 
 	s := &httpSession{
-		uploadQueue:      NewUploadQueue(int(h.ln.config.GetNormalizedScMaxConcurrentPosts().To)),
+		uploadQueue:      NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 		isFullyConnected: done.New(),
 	}
 
@@ -102,10 +104,29 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 	h.config.WriteResponseHeader(writer)
 
+	/*
+		clientVer := []int{0, 0, 0}
+		x_version := strings.Split(request.URL.Query().Get("x_version"), ".")
+		for j := 0; j < 3 && len(x_version) > j; j++ {
+			clientVer[j], _ = strconv.Atoi(x_version[j])
+		}
+	*/
+
 	validRange := h.config.GetNormalizedXPaddingBytes()
-	x_padding := int32(len(request.URL.Query().Get("x_padding")))
-	if validRange.To > 0 && (x_padding < validRange.From || x_padding > validRange.To) {
-		errors.LogInfo(context.Background(), "invalid x_padding length:", x_padding)
+	paddingLength := 0
+
+	referrer := request.Header.Get("Referer")
+	if referrer != "" {
+		if referrerURL, err := url.Parse(referrer); err == nil {
+			// Browser dialer cannot control the host part of referrer header, so only check the query
+			paddingLength = len(referrerURL.Query().Get("x_padding"))
+		}
+	} else {
+		paddingLength = len(request.URL.Query().Get("x_padding"))
+	}
+
+	if int32(paddingLength) < validRange.From || int32(paddingLength) > validRange.To {
+		errors.LogInfo(context.Background(), "invalid x_padding length:", int32(paddingLength))
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -159,7 +180,25 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				errors.LogInfoInner(context.Background(), err, "failed to upload (PushReader)")
 				writer.WriteHeader(http.StatusConflict)
 			} else {
+				writer.Header().Set("X-Accel-Buffering", "no")
+				writer.Header().Set("Cache-Control", "no-store")
 				writer.WriteHeader(http.StatusOK)
+				scStreamUpServerSecs := h.config.GetNormalizedScStreamUpServerSecs()
+				if referrer != "" && scStreamUpServerSecs.To > 0 {
+					go func() {
+						defer func() {
+							recover()
+						}()
+						for {
+							_, err := writer.Write(bytes.Repeat([]byte{'X'}, int(h.config.GetNormalizedXPaddingBytes().rand())))
+							if err != nil {
+								break
+							}
+							writer.(http.Flusher).Flush()
+							time.Sleep(time.Duration(scStreamUpServerSecs.rand()) * time.Second)
+						}
+					}()
+				}
 				<-request.Context().Done()
 			}
 			return
@@ -171,10 +210,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			return
 		}
 
-		payload, err := io.ReadAll(request.Body)
+		payload, err := io.ReadAll(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
 
 		if len(payload) > scMaxEachPostBytes {
-			errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request had size ", len(payload), ". Adjust scMaxEachPostBytes on the server to be at least as large as client.")
+			errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
 			writer.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -333,30 +372,30 @@ func ListenSH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Net:  "unix",
 		}, streamSettings.SocketSettings)
 		if err != nil {
-			return nil, errors.New("failed to listen unix domain socket(for SH) on ", address).Base(err)
+			return nil, errors.New("failed to listen UNIX domain socket for XHTTP on ", address).Base(err)
 		}
-		errors.LogInfo(ctx, "listening unix domain socket(for SH) on ", address)
+		errors.LogInfo(ctx, "listening UNIX domain socket for XHTTP on ", address)
 	} else if l.isH3 { // quic
 		Conn, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{
 			IP:   address.IP(),
 			Port: int(port),
 		}, streamSettings.SocketSettings)
 		if err != nil {
-			return nil, errors.New("failed to listen UDP(for SH3) on ", address, ":", port).Base(err)
+			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		h3listener, err := quic.ListenEarly(Conn, tlsConfig, nil)
 		if err != nil {
-			return nil, errors.New("failed to listen QUIC(for SH3) on ", address, ":", port).Base(err)
+			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		l.h3listener = h3listener
-		errors.LogInfo(ctx, "listening QUIC(for SH3) on ", address, ":", port)
+		errors.LogInfo(ctx, "listening QUIC for XHTTP/3 on ", address, ":", port)
 
 		l.h3server = &http3.Server{
 			Handler: handler,
 		}
 		go func() {
 			if err := l.h3server.ServeListener(l.h3listener); err != nil {
-				errors.LogWarningInner(ctx, err, "failed to serve http3 for splithttp")
+				errors.LogWarningInner(ctx, err, "failed to serve HTTP/3 for XHTTP/3")
 			}
 		}()
 	} else { // tcp
@@ -369,9 +408,9 @@ func ListenSH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Port: int(port),
 		}, streamSettings.SocketSettings)
 		if err != nil {
-			return nil, errors.New("failed to listen TCP(for SH) on ", address, ":", port).Base(err)
+			return nil, errors.New("failed to listen TCP for XHTTP on ", address, ":", port).Base(err)
 		}
-		errors.LogInfo(ctx, "listening TCP(for SH) on ", address, ":", port)
+		errors.LogInfo(ctx, "listening TCP for XHTTP on ", address, ":", port)
 	}
 
 	// tcp/unix (h1/h2)
@@ -397,7 +436,7 @@ func ListenSH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 		go func() {
 			if err := l.server.Serve(l.listener); err != nil {
-				errors.LogWarningInner(ctx, err, "failed to serve http for splithttp")
+				errors.LogWarningInner(ctx, err, "failed to serve HTTP for XHTTP")
 			}
 		}()
 	}
